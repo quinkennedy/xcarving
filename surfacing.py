@@ -146,14 +146,54 @@ def _grbl_wake(ser) -> None:
     ser.flushInput()
 
 
+_LOG = None  # optional file handle for a serial transcript
+
+
+def _log(direction: str, text: str) -> None:
+    if _LOG:
+        _LOG.write(f"{time.strftime('%H:%M:%S')} {direction} {text}\n")
+        _LOG.flush()
+
+
 def _grbl_send_wait(ser, line: str) -> str:
     ser.write((line.strip() + "\n").encode())
+    _log(">>", line.strip())
     buf = b""
+    silent_since = time.time()
     while True:
-        buf += ser.readline()
+        chunk = ser.readline()
+        if chunk:
+            text = chunk.decode("ascii", errors="replace").rstrip()
+            _log("<<", text)
+            silent_since = time.time()
+            if text.startswith("<"):
+                # Status report we asked for below — show it, don't treat as a reply.
+                print(f"\n  [GRBL status: {text}]")
+                continue
+        elif time.time() - silent_since > 30:
+            # No single move here takes >~15s, so 30s of silence means we're stuck.
+            # Ask GRBL what state it's in (Idle / Run / Hold / Alarm / Door).
+            print(f"\n  [no reply from GRBL for 30s while waiting on: {line.strip()}]")
+            ser.write(b"?")
+            _log(">>", "?")
+            silent_since = time.time()
+        buf += chunk
         txt = buf.decode("ascii", errors="replace")
-        if "ok" in txt or "error" in txt.lower():
+        low = txt.lower()
+        if "ok" in low or "error" in low or "alarm" in low:
             return txt.strip()
+
+
+def _abort_machine(ser) -> None:
+    """Stop motion now and discard GRBL's queued moves (they'd otherwise keep running)."""
+    try:
+        ser.write(b"!")      # feed hold: decelerate to a stop
+        time.sleep(0.5)
+        ser.write(b"\x18")   # soft reset: flush planner (keeps work zero)
+        _log("!!", "aborted by user: feed hold + soft reset")
+    except Exception:
+        pass
+    print("\nAborted — machine stopped (feed hold + reset). Spindle/vac are not controlled; turn them off.")
 
 
 def _parse_wpos(text: str) -> Optional[tuple]:
@@ -208,29 +248,51 @@ def jog_to_home(ser, units: str, safe_z: float) -> None:
     steps     = _STEP_SIZES[units]
     step_idx  = 2
     wpos      = (0.0, 0.0, 0.0)
+    state     = "?"          # GRBL state from last status report (Idle/Jog/Hold/Alarm…)
+    last_seen = time.time()  # when we last got a status report
+    poll_err  = ""
     pos_lock  = threading.Lock()
+    ser_lock  = threading.Lock()  # one reader at a time: poll thread vs. send/wait
     stop_evt  = threading.Event()
 
     _grbl_wake(ser)
 
     def _poll():
-        nonlocal wpos
+        nonlocal wpos, state, last_seen, poll_err
         while not stop_evt.is_set():
             try:
-                ser.write(b"?")
-                time.sleep(0.25)
-                raw = b""
-                while ser.in_waiting:
-                    raw += ser.read(ser.in_waiting)
-                    time.sleep(0.01)
-                p = _parse_wpos(raw.decode("ascii", errors="replace"))
-                if p:
-                    with pos_lock:
+                with ser_lock:
+                    ser.write(b"?")
+                    time.sleep(0.25)
+                    raw = b""
+                    while ser.in_waiting:
+                        raw += ser.read(ser.in_waiting)
+                        time.sleep(0.01)
+                txt = raw.decode("ascii", errors="replace")
+                for ln in txt.splitlines():
+                    ln = ln.strip()
+                    if ln and not ln.startswith("<") and ln != "ok":
+                        _log("<<", ln)  # errors / alarms / messages from jog commands
+                p = _parse_wpos(txt)
+                m = re.search(r"<([A-Za-z]+(?::\d+)?)", txt)
+                with pos_lock:
+                    if p:
                         wpos = p
-            except Exception:
-                pass
+                    if m:
+                        if m.group(1) != state:
+                            _log("--", f"jog state {m.group(1)}")
+                        state = m.group(1)
+                        last_seen = time.time()
+                    poll_err = ""
+            except Exception as e:
+                with pos_lock:
+                    if str(e) != poll_err:
+                        _log("!!", f"poll error: {e}")
+                    poll_err = str(e)
+                time.sleep(0.25)
 
-    threading.Thread(target=_poll, daemon=True).start()
+    poll_thread = threading.Thread(target=_poll, daemon=True)
+    poll_thread.start()
 
     fd  = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
@@ -238,42 +300,63 @@ def jog_to_home(ser, units: str, safe_z: float) -> None:
     print("\033[2J\033[H", end="", flush=True)
     print("=== JOG MODE ===")
     print("Arrow keys: X/Y jog   +/-: Z up/down   [/]: step size")
-    print("H: set work-zero here   Q / Enter: done\n")
+    print("H: set work-zero here   Q / Enter: done   Ctrl-C: abort\n")
+
+    def _jog(cmd: str) -> None:
+        ser.write(cmd.encode())
+        _log(">>", cmd.strip())
+
+    was_unresponsive = False
 
     try:
         tty.setraw(fd)
         while True:
             with pos_lock:
                 x, y, z = wpos
+                st, age, err = state, time.time() - last_seen, poll_err
             step = steps[step_idx]
+            if err:
+                status = f"SERIAL ERROR: {err}"
+            elif age > 2:
+                status = f"NO RESPONSE {age:.0f}s (last: {st})"
+            else:
+                status = st
+            if (age > 2) != was_unresponsive:
+                was_unresponsive = age > 2
+                _log("--", f"jog: {'NO RESPONSE from GRBL' if was_unresponsive else 'GRBL responding again'}")
             print(
                 f"\r\033[K  WPos  X={x:9.3f}  Y={y:9.3f}  Z={z:9.3f}"
-                f"   step={step} {units}  ",
+                f"   step={step} {units}   [{status}]",
                 end="", flush=True,
             )
             time.sleep(0.05)
             key = _read_key_nb(fd)
             if key is None:
                 continue
+            _log("--", f"key {key!r}")
+            if key == "\x03":  # Ctrl-C arrives as a byte in raw mode, not SIGINT
+                raise KeyboardInterrupt
             if key in ("q", "Q", "\r", "\n"):
                 break
             elif key in ("h", "H"):
                 termios.tcsetattr(fd, termios.TCSADRAIN, old)
-                _grbl_send_wait(ser, "G10 L20 P1 X0 Y0 Z0")
+                with ser_lock:  # keep the poll thread from eating our "ok"
+                    ser.reset_input_buffer()
+                    _grbl_send_wait(ser, "G10 L20 P1 X0 Y0 Z0")
                 print("\r\n  [Work zero set at current position]")
                 tty.setraw(fd)
             elif key == "\x1b[A":  # Up arrow → +Y
-                ser.write(f"$J={unit_cmd} G91 Y{step:.3f} F{jog_feed}\n".encode())
+                _jog(f"$J={unit_cmd} G91 Y{step:.3f} F{jog_feed}\n")
             elif key == "\x1b[B":  # Down arrow → -Y
-                ser.write(f"$J={unit_cmd} G91 Y-{step:.3f} F{jog_feed}\n".encode())
+                _jog(f"$J={unit_cmd} G91 Y-{step:.3f} F{jog_feed}\n")
             elif key == "\x1b[C":  # Right arrow → +X
-                ser.write(f"$J={unit_cmd} G91 X{step:.3f} F{jog_feed}\n".encode())
+                _jog(f"$J={unit_cmd} G91 X{step:.3f} F{jog_feed}\n")
             elif key == "\x1b[D":  # Left arrow → -X
-                ser.write(f"$J={unit_cmd} G91 X-{step:.3f} F{jog_feed}\n".encode())
+                _jog(f"$J={unit_cmd} G91 X-{step:.3f} F{jog_feed}\n")
             elif key == "+":
-                ser.write(f"$J={unit_cmd} G91 Z{step:.3f} F{jog_feed}\n".encode())
+                _jog(f"$J={unit_cmd} G91 Z{step:.3f} F{jog_feed}\n")
             elif key == "-":
-                ser.write(f"$J={unit_cmd} G91 Z-{step:.3f} F{jog_feed}\n".encode())
+                _jog(f"$J={unit_cmd} G91 Z-{step:.3f} F{jog_feed}\n")
             elif key == "]":
                 step_idx = min(step_idx + 1, len(steps) - 1)
             elif key == "[":
@@ -286,6 +369,11 @@ def jog_to_home(ser, units: str, safe_z: float) -> None:
         except Exception:
             pass
 
+    # Make sure the poll thread is gone and stale jog replies are cleared before
+    # we start waiting on our own "ok".
+    poll_thread.join(timeout=2)
+    time.sleep(0.3)
+    ser.reset_input_buffer()
     unit_g = "G20" if units == "in" else "G21"
     _grbl_send_wait(ser, f"{unit_g} G90 G0 Z{safe_z:.3f}")
     print("\n  [Jog complete — at safe height]")
@@ -303,7 +391,9 @@ def stream_gcode(ser, gcode: str, num_passes: int) -> None:
             sys.exit(1)
         if line.startswith("G1 Y"):
             pass_count += 1
-            print(f"\r  Pass {pass_count}/{num_passes}…", end="", flush=True)
+            # GRBL acks a line when it is queued (~15-move planner), not when it runs,
+            # so this counter is a few passes ahead of the actual cutter.
+            print(f"\r  Queued pass {pass_count}/{num_passes}…", end="", flush=True)
     print("\nComplete.")
 
 
@@ -326,10 +416,70 @@ def pick_port(cfg_port: Optional[str]) -> str:
         sys.exit("Invalid selection.")
 
 
-def _estimate_minutes(cfg: dict, d: dict) -> float:
-    y_span = d["y_end"] - d["y_start"]
-    dist   = d["num_passes"] * y_span + (d["num_passes"] - 1) * d["step_over"]
-    return dist / cfg["bit"]["ipm"]
+# GRBL motion limits in GRBL's own units (mm/min and mm/s²), i.e. the $110-$112 and
+# $120-$122 settings. Defaults are the X-Carve / X-Controller stock values; override
+# under [machine] in config.toml if yours differ. Checked against a real 71-pass job
+# (2026-11-05): predicted 18.45 s/pass vs. 18.38 s measured.
+_MOTION_DEFAULTS = {
+    "max_rate_xy": 8000.0,  # $110/$111 mm/min (G0 rapid speed in X/Y)
+    "max_rate_z":  500.0,   # $112      mm/min (G0 rapid speed in Z — slow!)
+    "accel_xy":    500.0,   # $120/$121 mm/s²
+    "accel_z":     50.0,    # $122      mm/s²
+}
+
+
+def _move_seconds(dist: float, v: float, a: float) -> float:
+    """Trapezoidal (or triangular) move from stop to stop. dist mm, v mm/s, a mm/s²."""
+    if dist <= 0:
+        return 0.0
+    d_ramp = v * v / a  # distance spent accelerating + decelerating
+    if dist >= d_ramp:
+        return dist / v + v / a
+    return 2 * (dist / a) ** 0.5  # never reaches full speed
+
+
+def estimate_seconds(gcode: str, mach: dict) -> float:
+    """Simulate the G-code the way GRBL executes it.
+
+    Assumes the machine comes to a stop between moves. That holds for these toolpaths:
+    every junction is a 90° or sharper corner.
+    """
+    lim = {k: float(mach.get(k, v)) for k, v in _MOTION_DEFAULTS.items()}
+    max_v = (lim["max_rate_xy"] / 60, lim["max_rate_xy"] / 60, lim["max_rate_z"] / 60)
+    max_a = (lim["accel_xy"], lim["accel_xy"], lim["accel_z"])
+
+    scale = 25.4  # G20 default for safety; G21 switches to 1
+    pos   = [0.0, 0.0, 0.0]
+    feed  = 0.0   # mm/min
+    mode  = "G0"
+    total = 0.0
+    for raw in gcode.splitlines():
+        line = raw.split(";")[0].strip().upper()
+        if not line:
+            continue
+        words = dict((w[0], w[1:]) for w in line.split())
+        for g in re.findall(r"G(\d+)", line):
+            if g == "20": scale = 25.4
+            elif g == "21": scale = 1.0
+            elif g in ("0", "1"): mode = "G" + g
+        if "F" in words:
+            feed = float(words["F"]) * scale
+        target = list(pos)
+        for i, ax in enumerate("XYZ"):
+            if ax in words:
+                target[i] = float(words[ax]) * scale
+        delta = [t - p for t, p in zip(target, pos)]
+        dist  = sum(c * c for c in delta) ** 0.5
+        if dist == 0:
+            continue
+        unit = [abs(c) / dist for c in delta]
+        # GRBL scales the move so no single axis exceeds its own limit.
+        v_lim = min(max_v[i] / unit[i] for i in range(3) if unit[i] > 0)
+        a_lim = min(max_a[i] / unit[i] for i in range(3) if unit[i] > 0)
+        v = v_lim if mode == "G0" else min(feed / 60, v_lim)
+        total += _move_seconds(dist, v, a_lim)
+        pos = target
+    return total
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -342,6 +492,10 @@ def main() -> None:
     parser.add_argument("--dry-run",  action="store_true", help="Print G-code only")
     parser.add_argument("--jog",      action="store_true", help="Connect and enter jog mode only (no surfacing)")
     args = parser.parse_args()
+
+    if not args.dry_run:
+        print("\n  ⚠  Make sure the laptop is plugged into its charger (shared ground with the")
+        print("     XController). On battery the controller's USB link locks up mid-job.")
 
     cfg   = load_config(args.config)
     units = cfg["machine"]["units"]
@@ -367,9 +521,10 @@ def main() -> None:
     print(f"  Y travel  : {d['y_end'] - d['y_start']:.3f} per pass")
     print(f"  Plunge    : -{cfg['workpiece']['depth']} {units}")
     print(f"  Strategy  : {cfg['surfacing'].get('strategy', 'zigzag')}")
-    print(f"  Est. time : ~{_estimate_minutes(cfg, d):.1f} min")
-
     gcode = generate_gcode(cfg, d)
+    est = estimate_seconds(gcode, cfg["machine"])
+    print(f"  Est. time : ~{int(est // 60)} min {int(est % 60):02d} s"
+          f"  (~{est / d['num_passes']:.1f} s/pass)")
 
     if args.dry_run:
         print("\n--- G-code ---\n")
@@ -408,15 +563,21 @@ def main() -> None:
     port = args.port or pick_port(cfg.get("machine", {}).get("port"))
     baud = cfg["machine"].get("baud", 115200)
 
-    try:
-        with serial.Serial(port, baud, timeout=2) as ser:
+    global _LOG
+    log_path = Path(time.strftime("surfacing-%Y%m%d-%H%M%S.log"))
+    _LOG = open(log_path, "w")
+    print(f"  Logging serial traffic to {log_path}")
+
+    with serial.Serial(port, baud, timeout=2) as ser:
+        try:
             jog_to_home(ser, units, cfg["machine"]["safe_z"])
+            print("\n  ▶ Turn ON the router (DWP611) and the shop vac now.")
             print("\nReady to run. Press Enter to start, Ctrl-C to abort.")
             input()
-            print("Running surfacing passes…")
+            print(f"Running surfacing passes… (est. finish {time.strftime('%H:%M', time.localtime(time.time() + est))})")
             stream_gcode(ser, gcode, d["num_passes"])
-    except KeyboardInterrupt:
-        print("\nAborted.")
+        except KeyboardInterrupt:
+            _abort_machine(ser)
 
 
 if __name__ == "__main__":

@@ -4,9 +4,9 @@ ipm        = 60   # cutting feed rate (mm/min — or in/min if units = "in")
 plunge_rate = 30   # plunge feed rate
 
 [workpiece]
-width  = 10.75   # X dimension (how far to step across)
-length = 13.5   # Y dimension (length of each pass)
-depth  = 0.007 #0.032   # how deep to cut (positive number)
+width  = 20.5   # X dimension (how far to step across)
+length = 13   # Y dimension (length of each pass)
+depth  = 0.032 #0.007 #0.032   # how deep to cut (positive number)
 
 [surfacing]
 overlap_pct  = 70   # % overlap between passes (40% → step-over = 60% of diameter)

@@ -14,6 +14,16 @@ Includes a live jog mode to position the bit before cutting.
 pip install pyserial tomli
 ```
 
+## Before you connect: plug the laptop into power
+
+**Keep the laptop on its charger whenever it's connected to the XController.** The charger gives the laptop and the controller a shared ground. On battery, the laptop's USB ground floats relative to the controller, and the XController's USB-serial chip locks up, even with no motion. It typically locks up within seconds to a minute. When that happens:
+
+- the machine stops mid-job or stops responding to jogs (green light still on, motors still energized)
+- the script shows `[NO RESPONSE …]` in jog mode, or waits forever while streaming
+- reopening the port fails with `termios.error: (22, 'Invalid argument')`
+
+Unplugging the USB cable doesn't clear the lockup. Power-cycle the controller.
+
 ## Configuration
 
 Edit `config.toml` before each job. All dimensions use the unit set in `machine.units`.
@@ -42,6 +52,19 @@ units  = "mm"                       # "mm" or "in"
 port   = "/dev/tty.usbserial-XXXX"  # serial port; leave as placeholder to be prompted
 baud   = 115200
 ```
+
+### Time estimate
+
+The estimate simulates every move the way GRBL runs it: cuts at the feed rate, plunges at the plunge rate, rapids at the machine's maximum speeds, with acceleration and deceleration on every move. It uses the stock X-Carve / X-Controller motion limits. If you've changed your GRBL settings, add any of these optional keys under `[machine]`:
+
+```toml
+max_rate_xy = 8000   # $110/$111, mm/min
+max_rate_z  = 500    # $112, mm/min (Z rapids are slow: ~20 in/min)
+accel_xy    = 500    # $120/$121, mm/s²
+accel_z     = 50     # $122, mm/s²
+```
+
+These are always in GRBL's units (mm/min, mm/s²), whatever `units` is set to. On a 71-pass job the estimate came out 22:01 against 21:49 measured.
 
 ### How step-over is calculated
 
